@@ -20,6 +20,7 @@
 
 // ----> Includes
 #include <iostream>
+#include <iomanip>
 #include <sstream>
 #include <string>
 
@@ -27,6 +28,7 @@
 
 // OpenCV includes
 #include <opencv2/opencv.hpp>
+#include <opencv2/aruco.hpp>
 
 //#undef HAVE_OPENCV_VIZ // Uncomment if cannot use Viz3D for point cloud rendering
 
@@ -59,7 +61,7 @@ int main(int argc, char *argv[])
 #ifdef EMBEDDED_ARM
     params.res = sl_oc::video::RESOLUTION::VGA;
 #else
-    params.res = sl_oc::video::RESOLUTION::HD720;
+    params.res = sl_oc::video::RESOLUTION::HD1080;
 #endif
     params.fps = sl_oc::video::FPS::FPS_30;
     params.verbose = verbose;
@@ -76,6 +78,9 @@ int main(int argc, char *argv[])
     }
     int sn = cap.getSerialNumber();
     std::cout << "Connected to camera sn: " << sn << std::endl;
+
+    cap.setAutoWhiteBalance(true);
+    // cap.resetAutoWhiteBalance();
     // <---- Create Video Capture
 
     // ----> Retrieve calibration file from Stereolabs server
@@ -108,8 +113,6 @@ int main(int argc, char *argv[])
     double cx = cameraMatrix_left.at<double>(0,2);
     double cy = cameraMatrix_left.at<double>(1,2);
 
-    std::cout << " Camera Matrix L: \n" << cameraMatrix_left << std::endl << std::endl;
-    std::cout << " Camera Matrix R: \n" << cameraMatrix_right << std::endl << std::endl;
 
 #ifdef USE_OCV_TAPI
     cv::UMat map_left_x_gpu = map_left_x.getUMat(cv::ACCESS_READ,cv::USAGE_ALLOCATE_DEVICE_MEMORY);
@@ -165,14 +168,15 @@ int main(int argc, char *argv[])
     // <---- Stereo matcher initialization
 
 
-    // ----> Point Cloud
-    cv::Mat cloudMat;
+    // Cached PnP result — updated whenever all 4 markers are visible
+    cv::Mat cached_R, cached_tvec;
+    bool pnp_valid = false;
 
-#ifdef HAVE_OPENCV_VIZ
-    cv::viz::Viz3d pc_viewer = cv::viz::Viz3d( "Point Cloud" );
-#endif
-    // <---- Point Cloud
-
+    // ArUco setup — markers 1,2,3,4 printed from DICT_4X4_50
+    cv::Ptr<cv::aruco::Dictionary> aruco_dict =
+        cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
+    cv::Ptr<cv::aruco::DetectorParameters> aruco_params =
+        cv::aruco::DetectorParameters::create();
 
     uint64_t last_ts=0; // Used to check new frame arrival
 
@@ -189,10 +193,12 @@ int main(int argc, char *argv[])
 
             // ----> Conversion from YUV 4:2:2 to BGR for visualization
 #ifdef USE_OCV_TAPI
-            cv::Mat frameYUV_cpu = cv::Mat( frame.height, frame.width, CV_8UC2, frame.data );
+            // Clone immediately: frame.data is a raw pointer into the grab thread's
+            // internal buffer, which can be overwritten mid-frame causing black flashes.
+            cv::Mat frameYUV_cpu = cv::Mat( frame.height, frame.width, CV_8UC2, frame.data ).clone();
             frameYUV = frameYUV_cpu.getUMat(cv::ACCESS_READ,cv::USAGE_ALLOCATE_HOST_MEMORY);
 #else
-            frameYUV = cv::Mat( frame.height, frame.width, CV_8UC2, frame.data );
+            frameYUV = cv::Mat( frame.height, frame.width, CV_8UC2, frame.data ).clone();
 #endif
             cv::cvtColor(frameYUV,frameBGR,cv::COLOR_YUV2BGR_YUYV);
             // <---- Conversion from YUV 4:2:2 to BGR for visualization
@@ -248,81 +254,182 @@ int main(int argc, char *argv[])
             stereoElabInfo << "Stereo processing: " << elapsed << " sec - Freq: " << 1./elapsed;
             // <---- Stereo matching
 
-            // ----> Show frames
-            sl_oc::tools::showImage("Right rect.", right_rect, params.res,true, remapElabInfo.str());
-            sl_oc::tools::showImage("Left rect.", left_rect, params.res,true, remapElabInfo.str());
-            // <---- Show frames
-
-            // ----> Show disparity image
-            cv::add(left_disp_float,-static_cast<double>(stereoPar.minDisparity-1),left_disp_float); // Minimum disparity offset correction
-            cv::multiply(left_disp_float,1./stereoPar.numDisparities,left_disp_image,255., CV_8UC1 ); // Normalization and rescaling
-
-            cv::applyColorMap(left_disp_image,left_disp_image,cv::COLORMAP_JET); // COLORMAP_INFERNO is better, but it's only available starting from OpenCV v4.1.0
-
-            sl_oc::tools::showImage("Disparity", left_disp_image, params.res,true, stereoElabInfo.str());
-            // <---- Show disparity image
-
             // ----> Extract Depth map
-            // The DISPARITY MAP can be now transformed in DEPTH MAP using the formula
             // depth = (f * B) / disparity
-            // where 'f' is the camera focal, 'B' is the camera baseline, 'disparity' is the pixel disparity
-
+            cv::add(left_disp_float,-static_cast<double>(stereoPar.minDisparity-1),left_disp_float); // Minimum disparity offset correction
             double num = static_cast<double>(fx*baseline);
             cv::divide(num,left_disp_float,left_depth_map);
 
             float central_depth = left_depth_map.getMat(cv::ACCESS_READ).at<float>(left_depth_map.rows/2, left_depth_map.cols/2 );
-            std::cout << "Depth of the central pixel: " << central_depth << " mm" << std::endl;
+            // std::cout << "Depth of the central pixel: " << central_depth << " mm" << std::endl;
             // <---- Extract Depth map
 
-            // ----> Create Point Cloud
-            sl_oc::tools::StopWatch pc_clock;
-            size_t buf_size = static_cast<size_t>(left_depth_map.cols * left_depth_map.rows);
-            std::vector<cv::Vec3d> buffer( buf_size, cv::Vec3f::all( std::numeric_limits<float>::quiet_NaN() ) );
-            cv::Mat depth_map_cpu = left_depth_map.getMat(cv::ACCESS_READ);
-            float* depth_vec = (float*)(&(depth_map_cpu.data[0]));
-
-#pragma omp parallel for
-            for(size_t idx=0; idx<buf_size;idx++ )
+            // ----> Green balloon detection + combined display
             {
-                size_t r = idx/left_depth_map.cols;
-                size_t c = idx%left_depth_map.cols;
-                double depth = static_cast<double>(depth_vec[idx]);
-                //std::cout << depth << " ";
-                if(!isinf(depth) && depth >=0 && depth > stereoPar.minDepth_mm && depth < stereoPar.maxDepth_mm)
+                cv::Mat right_cpu = right_rect.getMat(cv::ACCESS_READ).clone();
+                cv::Mat depth_mat = left_depth_map.getMat(cv::ACCESS_READ);
+
+
+                // ----> Green balloon detection
+                cv::Point2f balloon_img_pt(-1, -1);
+                float balloon_depth_mm = -1;
                 {
-                    buffer[idx].val[2] = depth; // Z
-                    buffer[idx].val[0] = (c-cx)*depth/fx; // X
-                    buffer[idx].val[1] = (r-cy)*depth/fy; // Y
+                    cv::Mat hsv, mask;
+                    cv::cvtColor(right_cpu, hsv, cv::COLOR_BGR2HSV);
+                    cv::inRange(hsv, cv::Scalar(35, 60, 40), cv::Scalar(85, 255, 255), mask);
+
+                    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7));
+                    cv::morphologyEx(mask, mask, cv::MORPH_OPEN,  kernel);
+                    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+
+                    std::vector<std::vector<cv::Point>> contours;
+                    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+                    double max_area = 0;
+                    int best = -1;
+                    for (int i = 0; i < (int)contours.size(); i++)
+                    {
+                        double a = cv::contourArea(contours[i]);
+                        if (a > max_area) { max_area = a; best = i; }
+                    }
+
+                    if (best >= 0 && max_area > 500)
+                    {
+                        cv::Rect bbox = cv::boundingRect(contours[best]);
+                        int bx = std::min(bbox.x + bbox.width  / 2, depth_mat.cols - 1);
+                        int by = std::min(bbox.y + bbox.height / 2, depth_mat.rows - 1);
+                        balloon_img_pt    = cv::Point2f(bx, by);
+                        balloon_depth_mm  = depth_mat.at<float>(by, bx);
+
+                        cv::rectangle(right_cpu, bbox, cv::Scalar(0, 255, 0), 2);
+                    }
                 }
+                // <---- Green balloon detection
+
+                // ----> ArUco marker detection, rectangle boundary, PnP + balloon world position
+                {
+                    std::vector<std::vector<cv::Point2f>> corners, rejected;
+                    std::vector<int> ids;
+                    cv::aruco::detectMarkers(right_cpu, aruco_dict, corners, ids,
+                                            aruco_params, rejected);
+                    cv::aruco::drawDetectedMarkers(right_cpu, corners, ids);
+
+                    // float-precision centers keyed by marker ID
+                    std::map<int, cv::Point2f> centers_f;
+                    for (size_t i = 0; i < ids.size(); i++)
+                    {
+                        cv::Point2f c(0, 0);
+                        for (auto& pt : corners[i]) c += pt;
+                        centers_f[ids[i]] = c * 0.25f;
+                    }
+
+                    const int order[4] = {1, 2, 3, 4}; // clockwise: TL, TR, BR, BL
+                    bool all_found = true;
+                    for (int id : order)
+                        if (centers_f.find(id) == centers_f.end()) { all_found = false; break; }
+
+                    if (all_found)
+                    {
+                        // draw rectangle overlay
+                        std::vector<cv::Point> pts;
+                        for (int id : order) pts.push_back(cv::Point(centers_f[id]));
+
+                        cv::Mat overlay = right_cpu.clone();
+                        cv::fillConvexPoly(overlay, pts, cv::Scalar(0, 200, 255));
+                        cv::addWeighted(overlay, 0.15, right_cpu, 0.85, 0, right_cpu);
+
+                        for (int i = 0; i < 4; i++)
+                            cv::line(right_cpu, pts[i], pts[(i+1)%4],
+                                     cv::Scalar(0, 200, 255), 2, cv::LINE_AA);
+
+                        const char* corner_labels[4] = {"1(TL)", "2(TR)", "3(BR)", "4(BL)"};
+                        for (int i = 0; i < 4; i++)
+                            cv::putText(right_cpu, corner_labels[i],
+                                        pts[i] + cv::Point(8, -8),
+                                        cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                                        cv::Scalar(0, 200, 255), 2);
+
+                        // PnP: world frame origin at marker 1, X along 1->4, Y along 1->2
+                        // Units: metres
+                        std::vector<cv::Point3f> obj_pts = {
+                            {0.0f,   0.0f,   0.0f},  // marker 1 TL
+                            {0.0f,   2.415f, 0.0f},  // marker 2 TR
+                            {1.265f, 2.415f, 0.0f},  // marker 3 BR
+                            {1.265f, 0.0f,   0.0f},  // marker 4 BL
+                        };
+                        std::vector<cv::Point2f> img_pts = {
+                            centers_f[1], centers_f[2], centers_f[3], centers_f[4]
+                        };
+
+                        // 3x3 intrinsic matrix (same for both rectified cameras)
+                        cv::Mat K = (cv::Mat_<double>(3,3)
+                            << fx, 0, cx,
+                               0, fy, cy,
+                               0,  0,  1);
+
+                        cv::Mat rvec, tvec;
+                        cv::solvePnP(obj_pts, img_pts, K, cv::Mat(), rvec, tvec);
+                        cv::Rodrigues(rvec, cached_R);
+                        cached_tvec = tvec;
+                        pnp_valid = true;
+                    }
+                }
+
+                // Use cached extrinsics for camera + balloon positions
+                if (pnp_valid)
+                {
+                    cv::Mat cam_world = -cached_R.t() * cached_tvec;
+                    std::ostringstream cam_info;
+                    cam_info << std::fixed << std::setprecision(2)
+                             << "Cam: ("
+                             << cam_world.at<double>(0) << ", "
+                             << cam_world.at<double>(1) << ", "
+                             << cam_world.at<double>(2) << ") m";
+                    cv::putText(right_cpu, cam_info.str(), cv::Point(10, right_cpu.rows - 40),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 100), 2);
+
+                    if (balloon_img_pt.x >= 0 &&
+                        balloon_depth_mm > stereoPar.minDepth_mm &&
+                        balloon_depth_mm < stereoPar.maxDepth_mm)
+                    {
+                        double Z_m = balloon_depth_mm / 1000.0;
+                        cv::Mat P_cam = (cv::Mat_<double>(3,1)
+                            << (balloon_img_pt.x - cx) * Z_m / fx,
+                               (balloon_img_pt.y - cy) * Z_m / fy,
+                               Z_m);
+
+                        cv::Mat P_world = cached_R.t() * (P_cam - cached_tvec);
+
+                        std::ostringstream pos;
+                        pos << std::fixed << std::setprecision(2)
+                            << "Balloon: ("
+                            << P_world.at<double>(0) << ", "
+                            << P_world.at<double>(1) << ", "
+                            << P_world.at<double>(2) << ") m";
+                        cv::putText(right_cpu, pos.str(),
+                                    cv::Point(balloon_img_pt.x + 10, balloon_img_pt.y + 20),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+                    }
+                }
+                // <---- ArUco marker detection, rectangle boundary, PnP + balloon world position
+
+                // scale to fit screen
+                const double scale_w = (double)1800 / right_cpu.cols;
+                const double scale_h = (double)900  / right_cpu.rows;
+                const double scale = std::min(1.0, std::min(scale_w, scale_h));
+                cv::Mat right_small;
+                cv::resize(right_cpu, right_small, cv::Size(), scale, scale);
+                cv::imshow("Right", right_small);
             }
+            // <---- Green balloon detection + combined display
 
-            cloudMat = cv::Mat( left_depth_map.rows, left_depth_map.cols, CV_64FC3, &buffer[0] ).clone();
-
-            double pc_elapsed = stereo_clock.toc();
-            std::stringstream pcElabInfo;
-//            pcElabInfo << "Point cloud processing: " << pc_elapsed << " sec - Freq: " << 1./pc_elapsed;
-            //std::cout << pcElabInfo.str() << std::endl;
-            // <---- Create Point Cloud
         }
-
 
         // ----> Keyboard handling
         int key = cv::waitKey( 5 );
         if(key=='q' || key=='Q') // Quit
             break;
         // <---- Keyboard handling
-
-#ifdef HAVE_OPENCV_VIZ
-        // ----> Show Point Cloud
-        cv::viz::WCloud cloudWidget( cloudMat, left_rect );
-        cloudWidget.setRenderingProperty( cv::viz::POINT_SIZE, 1 );
-        pc_viewer.showWidget( "Point Cloud", cloudWidget );
-        pc_viewer.spinOnce(1);
-
-        if(pc_viewer.wasStopped())
-            break;
-        // <---- Show Point Cloud
-#endif
     }
 
     return EXIT_SUCCESS;
