@@ -23,6 +23,12 @@
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <chrono>
+#include <cmath>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 #include "videocapture.hpp"
 
@@ -168,7 +174,7 @@ int main(int argc, char *argv[])
     // <---- Stereo matcher initialization
 
 
-    // Cached PnP result — updated whenever all 4 markers are visible
+    // Cached PnP result
     cv::Mat cached_R, cached_tvec;
     bool pnp_valid = false;
 
@@ -177,6 +183,93 @@ int main(int argc, char *argv[])
         cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
     cv::Ptr<cv::aruco::DetectorParameters> aruco_params =
         cv::aruco::DetectorParameters::create();
+
+    // World points: origin at marker 1, X along 1->4, Y along 1->2, metres
+    const std::vector<cv::Point3f> aruco_obj_pts = {
+        {0.0f,   0.0f,   0.0f},
+        {0.0f,   2.415f, 0.0f},
+        {1.265f, 2.415f, 0.0f},
+        {1.265f, 0.0f,   0.0f},
+    };
+    const cv::Mat K_mat = (cv::Mat_<double>(3,3)
+        << fx, 0, cx,
+           0, fy, cy,
+           0,  0,  1);
+
+    // Cached image-space marker centers (keyed by marker ID 1-4)
+    std::map<int, cv::Point2f> cached_centers;
+    bool detect_aruco = true;  // false once corners are loaded or found
+
+    // Try to load saved corners from file
+    const std::string corners_file = "aruco_corners.yml";
+    {
+        cv::FileStorage fs(corners_file, cv::FileStorage::READ);
+        if (fs.isOpened())
+        {
+            bool valid = true;
+            for (int id : {1, 2, 3, 4})
+            {
+                cv::Point2f pt;
+                fs["marker_" + std::to_string(id)] >> pt;
+                if (pt.x == 0 && pt.y == 0) { valid = false; break; }
+                cached_centers[id] = pt;
+            }
+            fs.release();
+
+            if (valid)
+            {
+                std::vector<cv::Point2f> img_pts = {
+                    cached_centers[1], cached_centers[2],
+                    cached_centers[3], cached_centers[4]
+                };
+                cv::Mat rvec, tvec;
+                cv::solvePnP(aruco_obj_pts, img_pts, K_mat, cv::Mat(), rvec, tvec);
+                cv::Rodrigues(rvec, cached_R);
+                cached_tvec = tvec;
+                pnp_valid = true;
+                detect_aruco = false;
+                std::cout << "Loaded ArUco corners from " << corners_file << std::endl;
+            }
+        }
+    }
+
+    // Connect to Redis on localhost:6379 (persistent connection, RESP protocol)
+    int redis_fd = -1;
+    {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            struct sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port   = htons(6379);
+            addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+            if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                redis_fd = fd;
+                std::cout << "Connected to Redis on localhost:6379" << std::endl;
+            } else {
+                ::close(fd);
+                std::cerr << "Cannot connect to Redis on localhost:6379" << std::endl;
+            }
+        }
+    }
+
+    // Send a Redis SET command over the persistent connection
+    auto redis_set = [&redis_fd](const std::string& key, const std::string& val) {
+        if (redis_fd < 0) return;
+        std::string cmd = "*3\r\n$3\r\nSET\r\n$" + std::to_string(key.size()) + "\r\n"
+            + key + "\r\n$" + std::to_string(val.size()) + "\r\n" + val + "\r\n";
+        if (::send(redis_fd, cmd.c_str(), cmd.size(), MSG_NOSIGNAL) < 0) {
+            ::close(redis_fd);
+            redis_fd = -1;
+        } else {
+            char buf[32];
+            ::recv(redis_fd, buf, sizeof(buf), MSG_DONTWAIT); // drain "+OK\r\n"
+        }
+    };
+
+    // Last valid velocity command — held for up to this many frames on detection dropout
+    double last_vx = 0.0, last_vy = 0.0, last_vyaw = 0.0;
+    int dropout_frames = 0;
+    const int max_dropout_frames = 5;
 
     uint64_t last_ts=0; // Used to check new frame arrival
 
@@ -269,6 +362,10 @@ int main(int argc, char *argv[])
                 cv::Mat right_cpu = right_rect.getMat(cv::ACCESS_READ).clone();
                 cv::Mat depth_mat = left_depth_map.getMat(cv::ACCESS_READ);
 
+                cv::Mat dog_P_world;      // empty = dog not localised this frame
+                double  dog_yaw = 0.0;
+                cv::Mat balloon_P_world;  // empty = balloon not localised this frame
+                bool    balloon_in_bounds = false;
 
                 // ----> Green balloon detection
                 cv::Point2f balloon_img_pt(-1, -1);
@@ -308,31 +405,68 @@ int main(int argc, char *argv[])
 
                 // ----> ArUco marker detection, rectangle boundary, PnP + balloon world position
                 {
-                    std::vector<std::vector<cv::Point2f>> corners, rejected;
-                    std::vector<int> ids;
-                    cv::aruco::detectMarkers(right_cpu, aruco_dict, corners, ids,
+                    // Always detect — needed for dynamic dog marker (ID 0)
+                    std::vector<std::vector<cv::Point2f>> all_corners, rejected;
+                    std::vector<int> all_ids;
+                    cv::aruco::detectMarkers(right_cpu, aruco_dict, all_corners, all_ids,
                                             aruco_params, rejected);
-                    cv::aruco::drawDetectedMarkers(right_cpu, corners, ids);
 
-                    // float-precision centers keyed by marker ID
-                    std::map<int, cv::Point2f> centers_f;
-                    for (size_t i = 0; i < ids.size(); i++)
+                    // Partition into dog (ID 0) and ground markers (IDs 1-4)
+                    int dog_idx = -1;
+                    std::map<int, cv::Point2f> detected_ground;
+                    std::vector<std::vector<cv::Point2f>> dog_corners_vec;
+                    std::vector<int> dog_ids_vec;
+
+                    for (size_t i = 0; i < all_ids.size(); i++)
                     {
                         cv::Point2f c(0, 0);
-                        for (auto& pt : corners[i]) c += pt;
-                        centers_f[ids[i]] = c * 0.25f;
+                        for (auto& pt : all_corners[i]) c += pt;
+                        c *= 0.25f;
+                        if (all_ids[i] == 0) {
+                            dog_idx = (int)i;
+                            dog_corners_vec.push_back(all_corners[i]);
+                            dog_ids_vec.push_back(0);
+                        } else {
+                            detected_ground[all_ids[i]] = c;
+                        }
                     }
 
-                    const int order[4] = {1, 2, 3, 4}; // clockwise: TL, TR, BR, BL
-                    bool all_found = true;
-                    for (int id : order)
-                        if (centers_f.find(id) == centers_f.end()) { all_found = false; break; }
-
-                    if (all_found)
+                    // Ground markers 1-4: update cache if detect_aruco
+                    if (detect_aruco)
                     {
-                        // draw rectangle overlay
+                        bool all_found = true;
+                        for (int id : {1, 2, 3, 4})
+                            if (detected_ground.find(id) == detected_ground.end()) { all_found = false; break; }
+
+                        if (all_found)
+                        {
+                            for (int id : {1, 2, 3, 4}) cached_centers[id] = detected_ground[id];
+
+                            std::vector<cv::Point2f> img_pts = {
+                                cached_centers[1], cached_centers[2],
+                                cached_centers[3], cached_centers[4]
+                            };
+                            cv::Mat rvec, tvec;
+                            cv::solvePnP(aruco_obj_pts, img_pts, K_mat, cv::Mat(), rvec, tvec);
+                            cv::Rodrigues(rvec, cached_R);
+                            cached_tvec = tvec;
+                            pnp_valid = true;
+                            detect_aruco = false;
+
+                            cv::FileStorage fs(corners_file, cv::FileStorage::WRITE);
+                            for (int id : {1, 2, 3, 4})
+                                fs << "marker_" + std::to_string(id) << cached_centers[id];
+                            fs.release();
+                            std::cout << "Saved ArUco corners to " << corners_file << std::endl;
+                        }
+                    }
+
+                    // Draw cached ground rectangle
+                    if (!cached_centers.empty())
+                    {
+                        const int order[4] = {1, 2, 3, 4};
                         std::vector<cv::Point> pts;
-                        for (int id : order) pts.push_back(cv::Point(centers_f[id]));
+                        for (int id : order) pts.push_back(cv::Point(cached_centers[id]));
 
                         cv::Mat overlay = right_cpu.clone();
                         cv::fillConvexPoly(overlay, pts, cv::Scalar(0, 200, 255));
@@ -348,30 +482,61 @@ int main(int argc, char *argv[])
                                         pts[i] + cv::Point(8, -8),
                                         cv::FONT_HERSHEY_SIMPLEX, 0.55,
                                         cv::Scalar(0, 200, 255), 2);
+                    }
 
-                        // PnP: world frame origin at marker 1, X along 1->4, Y along 1->2
-                        // Units: metres
-                        std::vector<cv::Point3f> obj_pts = {
-                            {0.0f,   0.0f,   0.0f},  // marker 1 TL
-                            {0.0f,   2.415f, 0.0f},  // marker 2 TR
-                            {1.265f, 2.415f, 0.0f},  // marker 3 BR
-                            {1.265f, 0.0f,   0.0f},  // marker 4 BL
-                        };
-                        std::vector<cv::Point2f> img_pts = {
-                            centers_f[1], centers_f[2], centers_f[3], centers_f[4]
-                        };
+                    // Dog marker (ID 0): draw outline + forward arrow + world position label
+                    cv::aruco::drawDetectedMarkers(right_cpu, dog_corners_vec, dog_ids_vec);
+                    if (dog_idx >= 0)
+                    {
+                        const auto& dc = all_corners[dog_idx];
+                        // ArUco corners: [TL, TR, BR, BL]; tag "up" = top edge - bottom edge
+                        cv::Point2f top_mid = (dc[0] + dc[1]) * 0.5f;
+                        cv::Point2f bot_mid = (dc[3] + dc[2]) * 0.5f;
+                        cv::Point2f center  = (top_mid + bot_mid) * 0.5f;
+                        cv::Point2f fwd     = top_mid - bot_mid; // forward direction in image
 
-                        // 3x3 intrinsic matrix (same for both rectified cameras)
-                        cv::Mat K = (cv::Mat_<double>(3,3)
-                            << fx, 0, cx,
-                               0, fy, cy,
-                               0,  0,  1);
+                        cv::arrowedLine(right_cpu,
+                                        cv::Point(center), cv::Point(center + fwd),
+                                        cv::Scalar(0, 165, 255), 2, cv::LINE_AA, 0, 0.25);
 
-                        cv::Mat rvec, tvec;
-                        cv::solvePnP(obj_pts, img_pts, K, cv::Mat(), rvec, tvec);
-                        cv::Rodrigues(rvec, cached_R);
-                        cached_tvec = tvec;
-                        pnp_valid = true;
+                        if (pnp_valid)
+                        {
+                            int bx = std::min((int)center.x, depth_mat.cols - 1);
+                            int by = std::min((int)center.y, depth_mat.rows - 1);
+                            float dog_depth_mm = depth_mat.at<float>(by, bx);
+
+                            if (dog_depth_mm > stereoPar.minDepth_mm &&
+                                dog_depth_mm < stereoPar.maxDepth_mm)
+                            {
+                                double Z_m = dog_depth_mm / 1000.0;
+                                cv::Mat P_cam = (cv::Mat_<double>(3,1)
+                                    << (center.x - cx) * Z_m / fx,
+                                       (center.y - cy) * Z_m / fy,
+                                       Z_m);
+                                cv::Mat P_world = cached_R.t() * (P_cam - cached_tvec);
+
+                                // Unproject forward-arrow tip at same depth → world-frame heading
+                                cv::Point2f fwd_tip = center + fwd;
+                                cv::Mat P_fwd_cam = (cv::Mat_<double>(3,1)
+                                    << (fwd_tip.x - cx) * Z_m / fx,
+                                       (fwd_tip.y - cy) * Z_m / fy,
+                                       Z_m);
+                                cv::Mat heading = cached_R.t() * (P_fwd_cam - cached_tvec) - P_world;
+                                dog_yaw     = std::atan2(heading.at<double>(1), heading.at<double>(0));
+                                dog_P_world = P_world.clone();
+
+                                std::ostringstream dog_lbl;
+                                dog_lbl << std::fixed << std::setprecision(2)
+                                        << "Dog: ("
+                                        << P_world.at<double>(0) << ", "
+                                        << P_world.at<double>(1) << ", "
+                                        << P_world.at<double>(2) << ") m";
+                                cv::putText(right_cpu, dog_lbl.str(),
+                                            cv::Point(center.x + 10, center.y - 10),
+                                            cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                                            cv::Scalar(0, 165, 255), 2);
+                            }
+                        }
                     }
                 }
 
@@ -399,19 +564,88 @@ int main(int argc, char *argv[])
                                Z_m);
 
                         cv::Mat P_world = cached_R.t() * (P_cam - cached_tvec);
+                        balloon_P_world = P_world.clone();
+
+                        double bpx = P_world.at<double>(0);
+                        double bpy = P_world.at<double>(1);
+                        balloon_in_bounds = (bpx >= 0.0 && bpx <= 1.265 &&
+                                             bpy >= 0.0 && bpy <= 2.415);
 
                         std::ostringstream pos;
                         pos << std::fixed << std::setprecision(2)
                             << "Balloon: ("
-                            << P_world.at<double>(0) << ", "
-                            << P_world.at<double>(1) << ", "
+                            << bpx << ", " << bpy << ", "
                             << P_world.at<double>(2) << ") m";
+                        if (balloon_in_bounds) pos << " [IN]";
                         cv::putText(right_cpu, pos.str(),
                                     cv::Point(balloon_img_pt.x + 10, balloon_img_pt.y + 20),
-                                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                                    balloon_in_bounds ? cv::Scalar(0, 255, 255) : cv::Scalar(0, 255, 0), 2);
                     }
                 }
                 // <---- ArUco marker detection, rectangle boundary, PnP + balloon world position
+
+                // ----> Velocity command: move dog under balloon when balloon is in rectangle bounds
+                {
+                    double ts = frame.timestamp / 1e9; // camera frame timestamp, nanoseconds → seconds
+
+                    double vx = 0.0, vy = 0.0, vyaw = 0.0;
+
+                    if (balloon_in_bounds && !dog_P_world.empty() && !balloon_P_world.empty()
+                        && balloon_P_world.at<double>(2) >= 0.2)
+                    {
+                        dropout_frames = 0;
+                        const double gain     = 2.0;
+                        const double max_v    = 1.0;
+                        const double vy_gain  = 2.0;
+                        const double max_vy   = 0.6;
+                        const double yaw_gain = 1.2;
+                        const double max_vyaw = 1.0;
+
+                        double ex = balloon_P_world.at<double>(0) - dog_P_world.at<double>(0);
+                        double ey = balloon_P_world.at<double>(1) - dog_P_world.at<double>(1);
+
+                        // Rotate world-frame error into dog body frame (x=forward, y=left)
+                        double c = std::cos(dog_yaw), s = std::sin(dog_yaw);
+                        double ex_b =  ex * c + ey * s;
+                        double ey_b = -ex * s + ey * c;
+
+                        double angle_err = std::atan2(ey_b, ex_b);
+                        bool behind = std::abs(angle_err) > M_PI_2;
+
+                        // Quadratic ramp: preserves sign, grows much faster with distance
+                        auto sq = [](double v){ return std::copysign(v * v, v); };
+
+                        if (!behind) {
+                            // Balloon in front hemisphere: turn and drive forward
+                            vyaw = std::max(-max_vyaw, std::min(max_vyaw, angle_err * yaw_gain));
+                            vx   = std::max(0.0,      std::min(max_v,    sq(ex_b) * gain));
+                            vy   = std::max(-max_vy,  std::min(max_vy,   sq(ey_b) * vy_gain));
+                        } else {
+                            // Balloon behind: back up toward it, light lateral, gentle yaw
+                            vx   = std::max(-max_v,   std::min(0.0,      sq(ex_b) * gain));
+                            vy   = std::max(-max_vy,  std::min(max_vy,   sq(ey_b) * vy_gain));
+                            vyaw = std::max(-max_vyaw, std::min(max_vyaw, angle_err * 0.3));
+                        }
+                    }
+
+                    // On dropout, hold the last valid command for up to max_dropout_frames
+                    if (vx == 0.0 && vy == 0.0 && vyaw == 0.0) {
+                        dropout_frames++;
+                        if (dropout_frames <= max_dropout_frames) {
+                            vx = last_vx; vy = last_vy; vyaw = last_vyaw;
+                        }
+                    } else {
+                        last_vx = vx; last_vy = vy; last_vyaw = vyaw;
+                    }
+
+                    std::ostringstream json;
+                    json << std::fixed << std::setprecision(4)
+                         << "{\"vx\":" << vx << ",\"vy\":" << vy
+                         << ",\"vyaw\":" << vyaw << ",\"timestamp\":" << ts << "}";
+                    redis_set("cmd_vel", json.str());
+                }
+                // <---- Velocity command
 
                 // scale to fit screen
                 const double scale_w = (double)1800 / right_cpu.cols;
@@ -432,6 +666,7 @@ int main(int argc, char *argv[])
         // <---- Keyboard handling
     }
 
+    if (redis_fd >= 0) ::close(redis_fd);
     return EXIT_SUCCESS;
 }
 
