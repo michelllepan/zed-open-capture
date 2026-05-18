@@ -315,52 +315,62 @@ int main(int argc, char *argv[])
             remapElabInfo << "Rectif. processing: " << remap_elapsed << " sec - Freq: " << 1./remap_elapsed;
             // <---- Apply rectification
 
-            // ----> Stereo matching
-            sl_oc::tools::StopWatch stereo_clock;
+            // Resize rectified images for on-demand ROI stereo matching
             double resize_fact = 1.0;
 #ifdef USE_HALF_SIZE_DISP
             resize_fact = 0.5;
-            // Resize the original images to improve performances
             cv::resize(left_rect,  left_for_matcher,  cv::Size(), resize_fact, resize_fact, cv::INTER_AREA);
             cv::resize(right_rect, right_for_matcher, cv::Size(), resize_fact, resize_fact, cv::INTER_AREA);
 #else
-            left_for_matcher = left_rect; // No data copy
-            right_for_matcher = right_rect; // No data copy
+            left_for_matcher  = left_rect;
+            right_for_matcher = right_rect;
 #endif
-            // Apply stereo matching
-            left_matcher->compute(left_for_matcher, right_for_matcher,left_disp_half);
-
-            left_disp_half.convertTo(left_disp_float,CV_32FC1);
-            cv::multiply(left_disp_float,1./16.,left_disp_float); // Last 4 bits of SGBM disparity are decimal
-
-#ifdef USE_HALF_SIZE_DISP
-            cv::multiply(left_disp_float,2.,left_disp_float); // Last 4 bits of SGBM disparity are decimal
-            cv::UMat tmp = left_disp_float; // Required for OpenCV 3.2
-            cv::resize(tmp, left_disp_float, cv::Size(), 1./resize_fact, 1./resize_fact, cv::INTER_AREA);
-#else
-            left_disp = left_disp_float;
-#endif
-
-
-            double elapsed = stereo_clock.toc();
-            std::stringstream stereoElabInfo;
-            stereoElabInfo << "Stereo processing: " << elapsed << " sec - Freq: " << 1./elapsed;
-            // <---- Stereo matching
-
-            // ----> Extract Depth map
-            // depth = (f * B) / disparity
-            cv::add(left_disp_float,-static_cast<double>(stereoPar.minDisparity-1),left_disp_float); // Minimum disparity offset correction
-            double num = static_cast<double>(fx*baseline);
-            cv::divide(num,left_disp_float,left_depth_map);
-
-            float central_depth = left_depth_map.getMat(cv::ACCESS_READ).at<float>(left_depth_map.rows/2, left_depth_map.cols/2 );
-            // std::cout << "Depth of the central pixel: " << central_depth << " mm" << std::endl;
-            // <---- Extract Depth map
 
             // ----> Green balloon detection + combined display
             {
                 cv::Mat right_cpu = right_rect.getMat(cv::ACCESS_READ).clone();
-                cv::Mat depth_mat = left_depth_map.getMat(cv::ACCESS_READ);
+
+                // Run SGBM on a small ROI around a point; returns depth in mm, -1 if invalid.
+                // ROI extends numDisparities pixels left of the point so the full disparity
+                // search range is contained within the same crop for both images.
+                auto depth_at_pt = [&](int px, int py) -> float {
+                    int phx = (int)std::round(px * resize_fact);
+                    int phy = (int)std::round(py * resize_fact);
+                    int nd  = stereoPar.numDisparities;
+                    const int mar = 15;
+                    int x0 = std::max(0, phx - nd - mar);
+                    int y0 = std::max(0, phy - mar);
+                    int x1 = std::min(left_for_matcher.cols, phx + mar + 1);
+                    int y1 = std::min(left_for_matcher.rows, phy + mar + 1);
+                    if (x1 <= x0 || y1 <= y0) return -1.f;
+                    int rw = x1 - x0, rh = y1 - y0;
+                    // SGBM requires contiguous memory and width > numDisparities
+                    if (rw <= nd || rh < 3) return -1.f;
+                    cv::Rect roi(x0, y0, rw, rh);
+                    cv::UMat left_crop, right_crop, roi_disp, roi_disp_f;
+                    left_for_matcher(roi).copyTo(left_crop);
+                    right_for_matcher(roi).copyTo(right_crop);
+                    left_matcher->compute(left_crop, right_crop, roi_disp);
+                    roi_disp.convertTo(roi_disp_f, CV_32FC1);
+                    cv::multiply(roi_disp_f, 1./16., roi_disp_f);
+                    if (resize_fact < 1.0) cv::multiply(roi_disp_f, 1./resize_fact, roi_disp_f);
+                    cv::Mat dm = roi_disp_f.getMat(cv::ACCESS_READ);
+                    int lx = phx - x0, ly = phy - y0;
+                    std::vector<float> samp;
+                    for (int dy = -4; dy <= 4; dy++)
+                        for (int dx = -4; dx <= 4; dx++) {
+                            float d = dm.at<float>(std::max(0,std::min(ly+dy,dm.rows-1)),
+                                                   std::max(0,std::min(lx+dx,dm.cols-1)));
+                            if (d > stereoPar.minDisparity) samp.push_back(d);
+                        }
+                    if (samp.empty()) return -1.f;
+                    auto mid = samp.begin() + samp.size()/2;
+                    std::nth_element(samp.begin(), mid, samp.end());
+                    float disp = *mid - (float)(stereoPar.minDisparity - 1);
+                    if (disp <= 0) return -1.f;
+                    float depth = (float)(fx * baseline / disp);
+                    return (depth > stereoPar.minDepth_mm && depth < stereoPar.maxDepth_mm) ? depth : -1.f;
+                };
 
                 cv::Mat dog_P_world;      // empty = dog not localised this frame
                 double  dog_yaw = 0.0;
@@ -393,10 +403,10 @@ int main(int argc, char *argv[])
                     if (best >= 0 && max_area > 500)
                     {
                         cv::Rect bbox = cv::boundingRect(contours[best]);
-                        int bx = std::min(bbox.x + bbox.width  / 2, depth_mat.cols - 1);
-                        int by = std::min(bbox.y + bbox.height / 2, depth_mat.rows - 1);
-                        balloon_img_pt    = cv::Point2f(bx, by);
-                        balloon_depth_mm  = depth_mat.at<float>(by, bx);
+                        int bx = bbox.x + bbox.width  / 2;
+                        int by = bbox.y + bbox.height / 2;
+                        balloon_img_pt   = cv::Point2f(bx, by);
+                        balloon_depth_mm = depth_at_pt(bx, by);
 
                         cv::rectangle(right_cpu, bbox, cv::Scalar(0, 255, 0), 2);
                     }
@@ -501,12 +511,9 @@ int main(int argc, char *argv[])
 
                         if (pnp_valid)
                         {
-                            int bx = std::min((int)center.x, depth_mat.cols - 1);
-                            int by = std::min((int)center.y, depth_mat.rows - 1);
-                            float dog_depth_mm = depth_mat.at<float>(by, bx);
+                            float dog_depth_mm = depth_at_pt((int)center.x, (int)center.y);
 
-                            if (dog_depth_mm > stereoPar.minDepth_mm &&
-                                dog_depth_mm < stereoPar.maxDepth_mm)
+                            if (dog_depth_mm > 0)
                             {
                                 double Z_m = dog_depth_mm / 1000.0;
                                 cv::Mat P_cam = (cv::Mat_<double>(3,1)
@@ -553,9 +560,7 @@ int main(int argc, char *argv[])
                     cv::putText(right_cpu, cam_info.str(), cv::Point(10, right_cpu.rows - 40),
                                 cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 100), 2);
 
-                    if (balloon_img_pt.x >= 0 &&
-                        balloon_depth_mm > stereoPar.minDepth_mm &&
-                        balloon_depth_mm < stereoPar.maxDepth_mm)
+                    if (balloon_img_pt.x >= 0 && balloon_depth_mm > 0)
                     {
                         double Z_m = balloon_depth_mm / 1000.0;
                         cv::Mat P_cam = (cv::Mat_<double>(3,1)
