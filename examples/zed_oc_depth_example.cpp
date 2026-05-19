@@ -600,15 +600,18 @@ int main(int argc, char *argv[])
                         && balloon_P_world.at<double>(2) >= 0.2)
                     {
                         dropout_frames = 0;
-                        const double gain     = 2.0;
+                        const double gain     = 6.0;
                         const double max_v    = 1.0;
                         const double vy_gain  = 2.0;
                         const double max_vy   = 0.6;
                         const double yaw_gain = 1.2;
                         const double max_vyaw = 1.0;
 
-                        double ex = balloon_P_world.at<double>(0) - dog_P_world.at<double>(0);
-                        double ey = balloon_P_world.at<double>(1) - dog_P_world.at<double>(1);
+                        // Target point: 22 cm in front of the ArUco tag (where the head is)
+                        double head_x = dog_P_world.at<double>(0) + 0.22 * std::cos(dog_yaw);
+                        double head_y = dog_P_world.at<double>(1) + 0.22 * std::sin(dog_yaw);
+                        double ex = balloon_P_world.at<double>(0) - head_x;
+                        double ey = balloon_P_world.at<double>(1) - head_y;
 
                         // Rotate world-frame error into dog body frame (x=forward, y=left)
                         double c = std::cos(dog_yaw), s = std::sin(dog_yaw);
@@ -631,6 +634,24 @@ int main(int argc, char *argv[])
                             vx   = std::max(-max_v,   std::min(0.0,      sq(ex_b) * gain));
                             vy   = std::max(-max_vy,  std::min(max_vy,   sq(ey_b) * vy_gain));
                             vyaw = std::max(-max_vyaw, std::min(max_vyaw, angle_err * 0.3));
+                        }
+                    }
+
+                    // Safety: if dog center or head is >1m outside the marker boundary, stop
+                    if (!dog_P_world.empty()) {
+                        double dx = dog_P_world.at<double>(0);
+                        double dy = dog_P_world.at<double>(1);
+                        double hx = dx + 0.22 * std::cos(dog_yaw);
+                        double hy = dy + 0.22 * std::sin(dog_yaw);
+                        const double margin = 1.0;
+                        auto outside = [&](double px, double py) {
+                            return px < -margin || px > 1.265 + margin ||
+                                   py < -margin || py > 2.415 + margin;
+                        };
+                        if (outside(dx, dy) || outside(hx, hy)) {
+                            vx = 0.0; vy = 0.0; vyaw = 0.0;
+                            last_vx = 0.0; last_vy = 0.0; last_vyaw = 0.0;
+                            dropout_frames = max_dropout_frames + 1;
                         }
                     }
 
@@ -704,7 +725,7 @@ int main(int argc, char *argv[])
                         cv::circle(right_cpu, bp, 8, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
                     }
 
-                    // Dog (orange dot + heading arrow)
+                    // Dog (orange dot + heading arrow) + head point (white dot)
                     // World heading (cos yaw, sin yaw) in (X,Y); maps to pixel (sin yaw, cos yaw)
                     if (!dog_P_world.empty()) {
                         cv::Point dp = w2td((float)dog_P_world.at<double>(0),
@@ -714,6 +735,11 @@ int main(int argc, char *argv[])
                             (int)(30.0f * std::sin(dog_yaw)),  // world Y component → pixel x
                             (int)(30.0f * std::cos(dog_yaw))); // world X component → pixel y
                         cv::arrowedLine(right_cpu, dp, tip, cv::Scalar(0, 165, 255), 2, cv::LINE_AA, 0, 0.3);
+
+                        // Head point: 22 cm in front of tag
+                        float hx = (float)(dog_P_world.at<double>(0) + 0.22 * std::cos(dog_yaw));
+                        float hy = (float)(dog_P_world.at<double>(1) + 0.22 * std::sin(dog_yaw));
+                        cv::circle(right_cpu, w2td(hx, hy), 5, cv::Scalar(255, 255, 255), -1, cv::LINE_AA);
                     }
                 }
                 // <---- Top-down view overlay
