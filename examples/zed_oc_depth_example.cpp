@@ -652,6 +652,72 @@ int main(int argc, char *argv[])
                 }
                 // <---- Velocity command
 
+                // ----> Top-down view overlay (top-left corner, drawn directly on frame)
+                // Axes: world Y → pixel X (horizontal), world X → pixel Y (vertical)
+                // Layout: 1(TL) -- 2(TR)
+                //         4(BL) -- 3(BR)
+                {
+                    const int   pad      = 18;
+                    const int   label_h  = 26;
+                    const float td_scale = 200.0f; // pixels per metre
+                    const float world_W  = 1.265f; // X axis (vertical in panel)
+                    const float world_H  = 2.415f; // Y axis (horizontal in panel)
+                    int td_w = (int)(world_H * td_scale) + 2 * pad;
+                    int td_h = label_h + (int)(world_W * td_scale) + 2 * pad;
+
+                    // 20% opacity black background
+                    if (td_w < right_cpu.cols && td_h < right_cpu.rows) {
+                        cv::Mat roi = right_cpu(cv::Rect(0, 0, td_w, td_h));
+                        cv::Mat black = cv::Mat::zeros(td_h, td_w, CV_8UC3);
+                        cv::addWeighted(black, 0.4, roi, 0.6, 0, roi);
+                    }
+
+                    cv::putText(right_cpu, "Top Down View",
+                                cv::Point(pad, label_h - 5),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(200, 200, 200), 1);
+
+                    // world Y → pixel x, world X → pixel y (offset below title)
+                    auto w2td = [&](float wx, float wy) -> cv::Point {
+                        return cv::Point((int)(pad + wy * td_scale),
+                                         (int)(label_h + pad + wx * td_scale));
+                    };
+
+                    // Rectangle outline with corner labels
+                    cv::Point mc[4] = {
+                        w2td(0.0f,   0.0f),     // marker 1: top-left
+                        w2td(0.0f,   world_H),  // marker 2: top-right
+                        w2td(world_W, world_H), // marker 3: bottom-right
+                        w2td(world_W, 0.0f),    // marker 4: bottom-left
+                    };
+                    const cv::Scalar rect_col(0, 200, 255);
+                    for (int i = 0; i < 4; i++)
+                        cv::line(right_cpu, mc[i], mc[(i+1)%4], rect_col, 2, cv::LINE_AA);
+                    cv::putText(right_cpu, "1", mc[0] + cv::Point( 4,  14), cv::FONT_HERSHEY_SIMPLEX, 0.5, rect_col, 2);
+                    cv::putText(right_cpu, "2", mc[1] + cv::Point(-14, 14), cv::FONT_HERSHEY_SIMPLEX, 0.5, rect_col, 2);
+                    cv::putText(right_cpu, "3", mc[2] + cv::Point(-14, -5), cv::FONT_HERSHEY_SIMPLEX, 0.5, rect_col, 2);
+                    cv::putText(right_cpu, "4", mc[3] + cv::Point( 4,  -5), cv::FONT_HERSHEY_SIMPLEX, 0.5, rect_col, 2);
+
+                    // Balloon (green dot)
+                    if (!balloon_P_world.empty()) {
+                        cv::Point bp = w2td((float)balloon_P_world.at<double>(0),
+                                            (float)balloon_P_world.at<double>(1));
+                        cv::circle(right_cpu, bp, 8, cv::Scalar(0, 255, 0), -1, cv::LINE_AA);
+                    }
+
+                    // Dog (orange dot + heading arrow)
+                    // World heading (cos yaw, sin yaw) in (X,Y); maps to pixel (sin yaw, cos yaw)
+                    if (!dog_P_world.empty()) {
+                        cv::Point dp = w2td((float)dog_P_world.at<double>(0),
+                                            (float)dog_P_world.at<double>(1));
+                        cv::circle(right_cpu, dp, 8, cv::Scalar(0, 165, 255), -1, cv::LINE_AA);
+                        cv::Point tip = dp + cv::Point(
+                            (int)(30.0f * std::sin(dog_yaw)),  // world Y component → pixel x
+                            (int)(30.0f * std::cos(dog_yaw))); // world X component → pixel y
+                        cv::arrowedLine(right_cpu, dp, tip, cv::Scalar(0, 165, 255), 2, cv::LINE_AA, 0, 0.3);
+                    }
+                }
+                // <---- Top-down view overlay
+
                 // scale to fit screen
                 const double scale_w = (double)1800 / right_cpu.cols;
                 const double scale_h = (double)900  / right_cpu.rows;
