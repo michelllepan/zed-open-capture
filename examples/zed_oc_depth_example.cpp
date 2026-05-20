@@ -22,9 +22,15 @@
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <fstream>
 #include <string>
 #include <chrono>
 #include <cmath>
+#include <ctime>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <queue>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -48,7 +54,147 @@
 #include "stopwatch.hpp"
 #include "stereo.hpp"
 #include "ocv_display.hpp"
+
+#include <librealsense2/rs.hpp>
 // <---- Includes
+
+// ---- Recording helpers -----------------------------------------------------
+
+static void rec_mkdirp(const std::string& p)
+{
+    int r = system(("mkdir -p \"" + p + "\"").c_str());
+    if (r != 0) std::cerr << "Warning: mkdir -p failed: " << p << "\n";
+}
+
+// Depth mm → colormap BGR for video encoding (0–8000 mm, TURBO colormap)
+static cv::Mat depth_to_colormap(const cv::Mat& depth_mm)
+{
+    cv::Mat gray, color;
+    depth_mm.convertTo(gray, CV_8U, 255.0 / 8000.0);
+    cv::applyColorMap(gray, color, cv::COLORMAP_TURBO);
+    return color;
+}
+
+// Frame queued from the main ZED loop to the recording thread
+struct RecFrame {
+    cv::Mat left_rect;   // full-res left rectified (BGR)
+    cv::Mat right_rect;  // full-res right rectified (BGR)
+    double  timestamp_s;
+};
+
+// RealSense recording thread: grab + write color and depth to MP4
+static void rs_record_thread(
+    rs2::pipeline& pipe, rs2::align& align_to_color, float depth_scale,
+    const std::string& color_path, const std::string& depth_path,
+    const std::string& csv_path,
+    std::atomic<bool>& stop)
+{
+    std::ofstream csv(csv_path);
+    csv << "frame,timestamp_s\n";
+    const int fourcc = cv::VideoWriter::fourcc('m','p','4','v');
+    cv::VideoWriter color_vw, depth_vw;
+    int idx = 0;
+    while (!stop) {
+        rs2::frameset frames;
+        if (!pipe.try_wait_for_frames(&frames, 100)) continue;
+        frames = align_to_color.process(frames);
+        rs2::video_frame cf = frames.get_color_frame();
+        rs2::depth_frame df = frames.get_depth_frame();
+        if (!cf || !df) continue;
+        int W = cf.get_width(), H = cf.get_height();
+        if (!color_vw.isOpened()) {
+            color_vw.open(color_path, fourcc, 30.0, cv::Size(W, H), true);
+            depth_vw.open(depth_path, fourcc, 30.0, cv::Size(W, H), true);
+        }
+        cv::Mat color(H, W, CV_8UC3, const_cast<void*>(cf.get_data()));
+        color_vw.write(color.clone());
+        cv::Mat depth_raw(H, W, CV_16UC1, const_cast<void*>(df.get_data()));
+        cv::Mat depth_f;
+        depth_raw.convertTo(depth_f, CV_32F);
+        cv::multiply(depth_f, depth_scale * 1000.f, depth_f);
+        cv::Mat depth_mm;
+        depth_f.convertTo(depth_mm, CV_16UC1);
+        depth_vw.write(depth_to_colormap(depth_mm));
+        csv << idx << "," << std::fixed << std::setprecision(6)
+            << cf.get_timestamp() / 1000.0 << "\n";
+        idx++;
+    }
+}
+
+// ZED recording thread: receive rectified pairs, compute full SGBM, write to MP4
+static void zed_record_thread(
+    std::queue<RecFrame>& q, std::mutex& q_mtx,
+    double fx, double baseline,
+    const sl_oc::tools::StereoSgbmPar& par,
+    const std::string& color_path, const std::string& depth_path,
+    const std::string& csv_path,
+    std::atomic<bool>& stop)
+{
+    cv::Ptr<cv::StereoSGBM> matcher =
+        cv::StereoSGBM::create(par.minDisparity, par.numDisparities, par.blockSize);
+    matcher->setMinDisparity(par.minDisparity);
+    matcher->setNumDisparities(par.numDisparities);
+    matcher->setBlockSize(par.blockSize);
+    matcher->setP1(par.P1);  matcher->setP2(par.P2);
+    matcher->setDisp12MaxDiff(par.disp12MaxDiff);
+    matcher->setMode(par.mode);
+    matcher->setPreFilterCap(par.preFilterCap);
+    matcher->setUniquenessRatio(par.uniquenessRatio);
+    matcher->setSpeckleWindowSize(par.speckleWindowSize);
+    matcher->setSpeckleRange(par.speckleRange);
+
+    std::ofstream csv(csv_path);
+    csv << "frame,timestamp_s\n";
+    const int fourcc = cv::VideoWriter::fourcc('m','p','4','v');
+    cv::VideoWriter color_vw, depth_vw;
+    int idx = 0;
+
+    while (!stop || !q.empty()) {
+        RecFrame frm;
+        {
+            std::lock_guard<std::mutex> lk(q_mtx);
+            if (q.empty()) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+            frm = std::move(q.front());
+            q.pop();
+        }
+        if (!color_vw.isOpened()) {
+            color_vw.open(color_path, fourcc, 5.0,
+                          cv::Size(frm.left_rect.cols, frm.left_rect.rows), true);
+            depth_vw.open(depth_path, fourcc, 5.0,
+                          cv::Size(frm.left_rect.cols, frm.left_rect.rows), true);
+        }
+        // Half-size stereo for SGBM
+        cv::Mat lh, rh, disp_raw, disp_f;
+        cv::resize(frm.left_rect,  lh, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
+        cv::resize(frm.right_rect, rh, cv::Size(), 0.5, 0.5, cv::INTER_AREA);
+        matcher->compute(lh, rh, disp_raw);
+        disp_raw.convertTo(disp_f, CV_32F, 1.0 / 16.0);
+        cv::multiply(disp_f, 2.0, disp_f);  // restore full-res scale
+        // Disparity → depth mm
+        cv::Mat depth_half(disp_f.rows, disp_f.cols, CV_16UC1, cv::Scalar(0));
+        for (int r = 0; r < disp_f.rows; r++) {
+            const float* dp = disp_f.ptr<float>(r);
+            uint16_t*    zp = depth_half.ptr<uint16_t>(r);
+            for (int c = 0; c < disp_f.cols; c++) {
+                if (dp[c] > par.minDisparity) {
+                    float dm = (float)(fx * baseline / dp[c]);
+                    if (dm > par.minDepth_mm && dm < par.maxDepth_mm)
+                        zp[c] = (uint16_t)dm;
+                }
+            }
+        }
+        cv::Mat depth_full;
+        cv::resize(depth_half, depth_full,
+                   cv::Size(frm.left_rect.cols, frm.left_rect.rows),
+                   0, 0, cv::INTER_NEAREST);
+        color_vw.write(frm.left_rect);
+        depth_vw.write(depth_to_colormap(depth_full));
+        csv << idx << "," << std::fixed << std::setprecision(6)
+            << frm.timestamp_s << "\n";
+        idx++;
+    }
+}
+// ---- End recording helpers -------------------------------------------------
 
 #define USE_OCV_TAPI // Comment to use "normal" cv::Mat instead of CV::UMat
 #define USE_HALF_SIZE_DISP // Comment to compute depth matching on full image frames
@@ -271,7 +417,58 @@ int main(int argc, char *argv[])
     int dropout_frames = 0;
     const int max_dropout_frames = 5;
 
+    // Balloon Z tracking for fall detection
+    double prev_balloon_z  = -1.0;
+    double prev_balloon_ts = -1.0;
+
     uint64_t last_ts=0; // Used to check new frame arrival
+
+    // ----> Recording setup
+    auto rec_now = std::chrono::system_clock::now();
+    std::time_t rec_t = std::chrono::system_clock::to_time_t(rec_now);
+    char rec_ts[32];
+    std::strftime(rec_ts, sizeof(rec_ts), "%Y%m%d_%H%M%S", std::localtime(&rec_t));
+    std::string rec_out = std::string("recording_") + rec_ts;
+    rec_mkdirp(rec_out);
+    std::cout << "Recording to: " << rec_out << std::endl;
+
+    std::atomic<bool> rec_stop{false};
+
+    // ZED recording queue + thread
+    std::queue<RecFrame> zed_q;
+    std::mutex           zed_q_mtx;
+    std::thread zed_rec_th(zed_record_thread,
+        std::ref(zed_q), std::ref(zed_q_mtx),
+        fx, baseline, std::cref(stereoPar),
+        rec_out + "/zed_color.mp4", rec_out + "/zed_depth.mp4",
+        rec_out + "/zed_timestamps.csv",
+        std::ref(rec_stop));
+
+    // RealSense recording thread (optional — skipped if no RS camera found)
+    rs2::pipeline    rs_pipe;
+    rs2::align       rs_align(RS2_STREAM_COLOR);
+    float            rs_depth_scale = 0.001f;
+    bool             rs_ok = false;
+    std::thread      rs_rec_th;
+    try {
+        rs2::config rs_cfg;
+        rs_cfg.enable_stream(RS2_STREAM_COLOR, 848, 480, RS2_FORMAT_BGR8, 30);
+        rs_cfg.enable_stream(RS2_STREAM_DEPTH, 848, 480, RS2_FORMAT_Z16,  30);
+        rs2::pipeline_profile rs_prof = rs_pipe.start(rs_cfg);
+        for (auto s : rs_prof.get_device().query_sensors())
+            if (auto ds = s.as<rs2::depth_sensor>())
+                { rs_depth_scale = ds.get_depth_scale(); break; }
+        rs_ok = true;
+        std::cout << "RealSense started (depth scale " << rs_depth_scale << " m/unit)" << std::endl;
+        rs_rec_th = std::thread(rs_record_thread,
+            std::ref(rs_pipe), std::ref(rs_align), rs_depth_scale,
+            rec_out + "/rs_color.mp4", rec_out + "/rs_depth.mp4",
+            rec_out + "/rs_timestamps.csv",
+            std::ref(rec_stop));
+    } catch (const rs2::error& e) {
+        std::cerr << "RealSense not available, skipping RS recording: " << e.what() << std::endl;
+    }
+    // <---- Recording setup
 
     // Infinite video grabbing loop
     while (1)
@@ -314,6 +511,16 @@ int main(int argc, char *argv[])
             std::stringstream remapElabInfo;
             remapElabInfo << "Rectif. processing: " << remap_elapsed << " sec - Freq: " << 1./remap_elapsed;
             // <---- Apply rectification
+
+            // ----> Queue ZED frame for recording (non-blocking, drop if backed up)
+            {
+                cv::Mat lr = left_rect.getMat(cv::ACCESS_READ).clone();
+                cv::Mat rr = right_rect.getMat(cv::ACCESS_READ).clone();
+                std::lock_guard<std::mutex> lk(zed_q_mtx);
+                if (zed_q.size() < 4)
+                    zed_q.push({lr, rr, frame.timestamp / 1e9});
+            }
+            // <---- Queue ZED frame for recording
 
             // Resize rectified images for on-demand ROI stereo matching
             double resize_fact = 1.0;
@@ -594,10 +801,34 @@ int main(int argc, char *argv[])
                 {
                     double ts = frame.timestamp / 1e9; // camera frame timestamp, nanoseconds → seconds
 
+                    // Balloon vertical velocity and tilt trigger
+                    double balloon_vz = 0.0;
+                    bool tilt = false;
+                    if (!balloon_P_world.empty()) {
+                        double cur_z = balloon_P_world.at<double>(2);
+                        if (prev_balloon_z >= 0.0 && prev_balloon_ts > 0.0) {
+                            double dt = ts - prev_balloon_ts;
+                            if (dt > 0.0) balloon_vz = (cur_z - prev_balloon_z) / dt;
+                        }
+                        // One-shot: fire only on the downward crossing of 1.2m,
+                        // and only if the balloon XY is within 10cm of the dog's head
+                        bool near_head = false;
+                        if (!dog_P_world.empty()) {
+                            double hx = dog_P_world.at<double>(0) + 0.22 * std::cos(dog_yaw);
+                            double hy = dog_P_world.at<double>(1) + 0.22 * std::sin(dog_yaw);
+                            double ddx = balloon_P_world.at<double>(0) - hx;
+                            double ddy = balloon_P_world.at<double>(1) - hy;
+                            near_head = std::sqrt(ddx*ddx + ddy*ddy) <= 0.10;
+                        }
+                        tilt = (prev_balloon_z >= 1.2 && cur_z < 1.2 && balloon_vz < 0.0 /* && near_head */);
+                        prev_balloon_z  = cur_z;
+                        prev_balloon_ts = ts;
+                    }
+
                     double vx = 0.0, vy = 0.0, vyaw = 0.0;
 
                     if (balloon_in_bounds && !dog_P_world.empty() && !balloon_P_world.empty()
-                        && balloon_P_world.at<double>(2) >= 0.2)
+                        && balloon_P_world.at<double>(2) >= 0.5)
                     {
                         dropout_frames = 0;
                         const double gain     = 6.0;
@@ -668,7 +899,8 @@ int main(int argc, char *argv[])
                     std::ostringstream json;
                     json << std::fixed << std::setprecision(4)
                          << "{\"vx\":" << vx << ",\"vy\":" << vy
-                         << ",\"vyaw\":" << vyaw << ",\"timestamp\":" << ts << "}";
+                         << ",\"vyaw\":" << vyaw << ",\"timestamp\":" << ts
+                         << ",\"tilt\":" << (tilt ? "true" : "false") << "}";
                     redis_set("cmd_vel", json.str());
                 }
                 // <---- Velocity command
@@ -764,6 +996,14 @@ int main(int argc, char *argv[])
     }
 
     if (redis_fd >= 0) ::close(redis_fd);
+
+    // ----> Recording teardown
+    rec_stop = true;
+    zed_rec_th.join();
+    if (rs_ok) { rs_pipe.stop(); rs_rec_th.join(); }
+    std::cout << "Recording saved to: " << rec_out << std::endl;
+    // <---- Recording teardown
+
     return EXIT_SUCCESS;
 }
 
